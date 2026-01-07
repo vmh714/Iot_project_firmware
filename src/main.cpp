@@ -1,11 +1,8 @@
-// INCLUDE LIB
 #include <Arduino.h>
-// library for hardware
-
-// library for MQTT
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "time.h" // Thư viện native để xử lý RTC nội và NTP
 
 #include "app_config.h"
 #include "door.h"
@@ -13,7 +10,6 @@
 
 // TaskHandle_t task_fp_handle = NULL;
 // TaskHandle_t task_door_handle = NULL;
-#define LEDPIN 2
 
 QueueHandle_t door_cmd_queue;   // Queue lệnh
 QueueHandle_t fp_request_queue; // Queue lệnh cho fp
@@ -27,6 +23,11 @@ static bool is_scanning = true;
 // WiFi
 const char *ssid = "IT Hoc Bach Khoa";        // Enter your Wi-Fi name
 const char *password = "chungtalamotgiadinh"; // Enter Wi-Fi password
+
+// NTP Server Configuration
+const char *ntpServer = "in.pool.ntp.org";
+const long gmtOffset_sec = 25200; // GMT+7 cho Vietnam (7 * 3600)
+const int daylightOffset_sec = 0;
 
 // MQTT Broker
 const char *mqtt_broker = "broker.emqx.io";
@@ -44,6 +45,23 @@ struct MqttMsg
   char topic[50];
   char payload[150];
 };
+
+// --- HÀM HỖ TRỢ LẤY THỜI GIAN TỪ RTC NỘI ---
+String get_iso_timestamp()
+{
+  struct tm timeinfo;
+  // getLocalTime sẽ lấy thời gian từ RTC nội (đã được sync bởi configTime)
+  if (!getLocalTime(&timeinfo))
+  {
+    return "1970-01-01T00:00:00Z"; // Trả về mặc định nếu chưa sync được giờ
+  }
+
+  char timeStringBuff[30];
+  // Định dạng chuỗi theo ISO 8601: YYYY-MM-DDTHH:MM:SSZ
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
+  return String(timeStringBuff);
+}
 
 const char *event_to_topic(SystemEventType_t type)
 {
@@ -65,6 +83,7 @@ const char *event_to_topic(SystemEventType_t type)
     return nullptr;
   }
 }
+
 void callback(char *topic, byte *payload, unsigned int length)
 {
   char expect_topic[128];
@@ -130,19 +149,22 @@ void MqttControlTask(void *pvParameter)
 
         Serial.println("[MQTT CTRL] Door unlock request");
       }
-
       /* ========= FINGERPRINT ENROLL ========= */
       else if (strcasecmp(cmd, "fp_enroll") == 0)
       {
-
+        int id = doc["id"] | -1;
+        if (id < 0)
+          if (id < 0)
+          {
+            Serial.println("[MQTT CTRL] fp_delete missing id");
+            continue;
+          }
         FingerprintRequestMsg_t req;
         req.type = FP_REQUEST_ENROLL;
-
+        req.id = id;
         xQueueSend(fp_request_queue, &req, 0);
-
         Serial.printf("[MQTT CTRL] FP enroll request");
       }
-
       /* ========= FINGERPRINT DELETE ========= */
       else if (strcasecmp(cmd, "fp_delete") == 0)
       {
@@ -152,28 +174,21 @@ void MqttControlTask(void *pvParameter)
           Serial.println("[MQTT CTRL] fp_delete missing id");
           continue;
         }
-
         FingerprintRequestMsg_t req;
         req.type = FP_REQUEST_DELETE_ID;
         req.id = id;
-
         xQueueSend(fp_request_queue, &req, 0);
-
         Serial.printf("[MQTT CTRL] FP delete request, id=%d\n", id);
       }
-
       /* ========= FINGERPRINT SHOW ALL ========= */
       else if (strcasecmp(cmd, "fp_show_all") == 0)
       {
         FingerprintRequestMsg_t req;
         req.type = FP_REQUEST_SHOW_ALL_ID;
         req.id = 0;
-
         xQueueSend(fp_request_queue, &req, 0);
-
         Serial.println("[MQTT CTRL] FP show all IDs request");
       }
-
       else
       {
         Serial.print("[MQTT CTRL] Unknown cmd: ");
@@ -182,6 +197,7 @@ void MqttControlTask(void *pvParameter)
     }
   }
 }
+
 void TaskMQTTClientLoop(void *pvParameters)
 {
   (void)pvParameters;
@@ -189,11 +205,8 @@ void TaskMQTTClientLoop(void *pvParameters)
   String cmd_topic;
   String status_topic;
 
-  cmd_topic =
-      String(topic_base) + "/" + client_id + "/command";
-
-  status_topic =
-      String(topic_base) + "/" + client_id + "/status";
+  cmd_topic = String(topic_base) + "/" + client_id + "/command";
+  status_topic = String(topic_base) + "/" + client_id + "/status";
 
   while (1)
   {
@@ -203,40 +216,25 @@ void TaskMQTTClientLoop(void *pvParameters)
       {
         Serial.println("[MQTT] Not connected, reconnecting...");
 
-        if (client.connect(
-                client_id.c_str(),
-                mqtt_username,
-                mqtt_password))
+        if (client.connect(client_id.c_str(), mqtt_username, mqtt_password))
         {
           Serial.println("[MQTT] Reconnected");
-
           client.subscribe(cmd_topic.c_str());
-
-          client.publish(
-              status_topic.c_str(),
-              "online");
-
+          client.publish(status_topic.c_str(), "online");
           Serial.print("[MQTT] Subscribed: ");
           Serial.println(cmd_topic);
-
-          Serial.print("[MQTT] Published: ");
-          Serial.println(status_topic);
         }
         else
         {
-          Serial.printf(
-              "[MQTT] Reconnect failed, state=%d\n",
-              client.state());
+          Serial.printf("[MQTT] Reconnect failed, state=%d\n", client.state());
         }
       }
       else
       {
         client.loop();
       }
-
       xSemaphoreGive(mqtt_client_mutex);
     }
-
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -244,18 +242,22 @@ void TaskMQTTClientLoop(void *pvParameters)
 void TaskMqttPublish(void *pvParameter)
 {
   SystemEvent_t evt;
-  char payload[128];
+  char payload[256]; // Tăng kích thước buffer để chứa chuỗi thời gian
 
-  Serial.println("[MQTT] Publish task started (fingerprint mode)");
+  Serial.println("[MQTT] Publish task started");
 
   for (;;)
   {
     // Chờ event từ fingerprint/system
     if (xQueueReceive(system_evt_queue, &evt, portMAX_DELAY) == pdTRUE)
     {
-      StaticJsonDocument<128> doc;
+      // Tăng size JSON Document để chứa timestamp
+      StaticJsonDocument<256> doc;
 
       doc["device"] = client_id;
+
+      // === THÊM TIMESTAMP VÀO JSON ===
+      doc["ts"] = get_iso_timestamp();
 
       switch (evt.type)
       {
@@ -276,7 +278,6 @@ void TaskMqttPublish(void *pvParameter)
         doc["event"] = "fp_enroll_done";
         doc["finger_id"] = evt.value;
         break;
-
       case EVT_FP_DELETE_DONE:
         doc["event"] = "fp_delete_done";
         doc["finger_id"] = evt.value;
@@ -284,7 +285,7 @@ void TaskMqttPublish(void *pvParameter)
 
       case EVT_FP_SHOW_ALL_DONE:
         doc["event"] = "fp_show_all_done";
-        // payload có thể là string list, hiện mock thì bỏ
+        doc["count_of_IDs"] = evt.value;
         break;
       /* ========= Door state ========= */
       case EVT_DOOR_LOCKED:
@@ -312,7 +313,6 @@ void TaskMqttPublish(void *pvParameter)
       {
         if (client.connected())
         {
-          // client.publish((String(topic) + "/event").c_str(), payload);
           const char *category = event_to_topic(evt.type);
           if (category)
           {
@@ -335,191 +335,176 @@ void TaskMqttPublish(void *pvParameter)
   }
 }
 
-void taskFingerprintMock(void *pv)
-{
-  FingerprintRequestMsg_t req;
-  String input;
+// ... (Giữ nguyên phần taskFingerprintMock và các handler khác) ...
+// void taskFingerprintMock(void *pv)
+// {
+//   FingerprintRequestMsg_t req;
+//   String input;
+//   static bool enrolling = false;
+//   static int next_mock_id = 1;
 
-  static bool enrolling = false;
-  static int next_mock_id = 1; // giả lập sensor cấp ID tăng dần
+//   Serial.println("[FP MOCK] Fingerprint mock task started");
+//   for (;;)
+//   {
+//     if (xQueueReceive(fp_request_queue, &req, 0) == pdTRUE)
+//     {
+//       switch (req.type)
+//       {
+//       case FP_REQUEST_ENROLL:
+//       {
+//         enrolling = true;
+//         vTaskDelay(pdMS_TO_TICKS(500));
+//         int new_id = next_mock_id++;
+//         SystemEvent_t evt;
+//         evt.type = EVT_FP_ENROLL_DONE;
+//         evt.value = new_id;
+//         xQueueSend(system_evt_queue, &evt, 0);
+//         enrolling = false;
+//         Serial.printf("[FP MOCK] ENROLL DONE → new ID = %d\n", new_id);
+//         break;
+//       }
+//       case FP_REQUEST_DELETE_ID:
+//       {
+//         SystemEvent_t evt;
+//         evt.type = EVT_FP_DELETE_DONE;
+//         evt.value = req.id;
+//         xQueueSend(system_evt_queue, &evt, 0);
+//         Serial.printf("[FP MOCK] DELETE id=%d -> OK (mock)\n", req.id);
+//         break;
+//       }
+//       case FP_REQUEST_SHOW_ALL_ID:
+//       {
+//         SystemEvent_t evt;
+//         evt.type = EVT_FP_SHOW_ALL_DONE;
+//         evt.value = 0;
+//         xQueueSend(system_evt_queue, &evt, 0);
+//         Serial.println("[FP MOCK] SHOW ALL DONE (mock)");
+//         break;
+//       }
+//       default:
+//         break;
+//       }
+//     }
+//     while (Serial.available())
+//     {
+//       char c = Serial.read();
+//       if (c == '\n' || c == '\r')
+//       {
+//         input.trim();
+//         if (input.equalsIgnoreCase("unknown"))
+//         {
+//           SystemEvent_t evt;
+//           evt.type = EVT_FP_UNKNOWN;
+//           evt.value = -1;
+//           xQueueSend(system_evt_queue, &evt, 0);
+//           Serial.println("[FP MOCK] NOT MATCH");
+//         }
+//         else
+//         {
+//           char *endptr;
+//           int id = strtol(input.c_str(), &endptr, 10);
+//           if (*endptr == '\0')
+//           {
+//             SystemEvent_t evt;
+//             evt.type = EVT_FP_MATCH;
+//             evt.value = id;
+//             xQueueSend(system_evt_queue, &evt, 0);
+//             DoorRequest_t door_cmd = DOOR_REQUEST_UNLOCK;
+//             xQueueSend(door_cmd_queue, &door_cmd, 0);
+//             Serial.printf("[FP MOCK] MATCH id=%d → unlock door\n", id);
+//           }
+//         }
+//         input = "";
+//       }
+//       else
+//       {
+//         input += c;
+//       }
+//     }
+//     vTaskDelay(pdMS_TO_TICKS(20));
+//   }
+// }
 
-  Serial.println("[FP MOCK] Fingerprint mock task started");
-  Serial.println("[FP MOCK] Commands:");
-  Serial.println("  <number>   -> MATCH (scan)");
-  Serial.println("  unknown    -> NOT MATCH");
-  Serial.println("  show       -> show all IDs");
-  Serial.println("  (ENROLL is triggered from MQTT)");
-
-  for (;;)
-  {
-    /* ========= HANDLE REQUEST FROM SYSTEM ========= */
-    if (xQueueReceive(fp_request_queue, &req, 0) == pdTRUE)
-    {
-      switch (req.type)
-      {
-      case FP_REQUEST_ENROLL:
-      {
-        enrolling = true;
-
-        /* giả lập delay sensor */
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        int new_id = next_mock_id++;
-
-        SystemEvent_t evt;
-        evt.type = EVT_FP_ENROLL_DONE;
-        evt.value = new_id;
-
-        xQueueSend(system_evt_queue, &evt, 0);
-
-        enrolling = false;
-
-        Serial.printf(
-            "[FP MOCK] ENROLL DONE → new ID = %d\n",
-            new_id);
-        break;
-      }
-
-      case FP_REQUEST_DELETE_ID:
-      {
-        SystemEvent_t evt;
-        evt.type = EVT_FP_DELETE_DONE;
-        evt.value = req.id;
-
-        xQueueSend(system_evt_queue, &evt, 0);
-
-        Serial.printf(
-            "[FP MOCK] DELETE id=%d -> OK (mock)\n",
-            req.id);
-        break;
-      }
-
-      case FP_REQUEST_SHOW_ALL_ID:
-      {
-        SystemEvent_t evt;
-        evt.type = EVT_FP_SHOW_ALL_DONE;
-        evt.value = 0;
-
-        xQueueSend(system_evt_queue, &evt, 0);
-
-        Serial.println("[FP MOCK] SHOW ALL DONE (mock)");
-        break;
-      }
-
-      default:
-        break;
-      }
-    }
-
-    /* ========= HANDLE SERIAL SCAN ========= */
-    while (Serial.available())
-    {
-      char c = Serial.read();
-
-      if (c == '\n' || c == '\r')
-      {
-        input.trim();
-
-        if (input.equalsIgnoreCase("unknown"))
-        {
-          SystemEvent_t evt;
-          evt.type = EVT_FP_UNKNOWN;
-          evt.value = -1;
-
-          xQueueSend(system_evt_queue, &evt, 0);
-          Serial.println("[FP MOCK] NOT MATCH");
-        }
-        else
-        {
-          char *endptr;
-          int id = strtol(input.c_str(), &endptr, 10);
-
-          if (*endptr == '\0')
-          {
-            SystemEvent_t evt;
-            evt.type = EVT_FP_MATCH;
-            evt.value = id;
-
-            xQueueSend(system_evt_queue, &evt, 0);
-
-            DoorRequest_t door_cmd = DOOR_REQUEST_UNLOCK;
-            xQueueSend(door_cmd_queue, &door_cmd, 0);
-
-            Serial.printf(
-                "[FP MOCK] MATCH id=%d → unlock door\n",
-                id);
-          }
-          else
-          {
-            Serial.println("[FP MOCK] Invalid input");
-          }
-        }
-
-        input = "";
-      }
-      else
-      {
-        input += c;
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-  }
-}
 void door_event_handler(DoorEvent_t res)
 {
   SystemEvent_t evt;
-  evt.value = 0; // door event không cần value
-
+  evt.value = 0;
   switch (res)
   {
   case DOOR_EVT_UNLOCKED:
     Serial.println("Door has been unlocked!");
-
-    sys_state = SYS_IDLE; // vẫn đang chờ mở
+    sys_state = SYS_IDLE;
     evt.type = EVT_DOOR_UNLOCKED_WAIT_OPEN;
     xQueueSend(system_evt_queue, &evt, 0);
     break;
-
   case DOOR_EVT_OPENED:
     Serial.println("Door opened");
-
     sys_state = SYS_DOOR_OPEN;
     evt.type = EVT_DOOR_OPEN;
     xQueueSend(system_evt_queue, &evt, 0);
     break;
-
   case DOOR_EVT_CLOSED_AND_LOCKED:
     Serial.println("Door closed and locked");
-
     sys_state = SYS_IDLE;
     evt.type = EVT_DOOR_LOCKED;
     xQueueSend(system_evt_queue, &evt, 0);
     break;
-
   case DOOR_EVT_WAIT_TIME_END_AND_LOCKED:
     Serial.println("Door auto-locked after timeout");
-
     sys_state = SYS_IDLE;
     evt.type = EVT_DOOR_LOCKED;
     xQueueSend(system_evt_queue, &evt, 0);
     break;
-
   default:
     break;
   }
 }
-void fingerprint_event_handler(FingerprintEvent_t evt, uint16_t id)
+void fingerprint_event_handler(FingerprintEvent_t res, uint16_t id)
 {
-  // DoorRequest_t cmd;
-  switch (evt)
+  DoorRequest_t cmd;
+  SystemEvent_t evt;
+
+  switch (res)
   {
   case FP_EVT_INIT_OK:
-    Serial.println("Fingerprint sensor ready");
+    Serial.println("[FP] Sensor ready");
     break;
 
   case FP_EVT_INIT_FAIL:
-    Serial.println("Fingerprint sensor init failed");
+    Serial.println("[FP] Sensor init failed");
+    break;
+
+  case FP_EVT_ENROLL_START:
+    Serial.printf("[FP] Start enrolling finger id=%d\n", id);
+    break;
+
+  case FP_EVT_ENROLL_STEP1_OK:
+    Serial.printf("[FP] Step 1 OK for finger id=%d. Please lift your finger.\n", id);
+    break;
+
+  case FP_EVT_ENROLL_STEP2_OK:
+    Serial.printf("[FP] Step 2 OK for finger id=%d. Creating model...\n", id);
+    break;
+
+  case FP_EVT_ENROLL_DONE:
+    Serial.printf("[FP] Enroll done for finger id=%d\n", id);
+    evt.type = EVT_FP_ENROLL_DONE;
+    evt.value = id;
+    xQueueSend(system_evt_queue, &evt, 0);
+    // Gửi event lên MQTT nếu cần
+    break;
+
+  case FP_EVT_DELETE_DONE:
+    Serial.printf("[FP] Delete done for finger id=%d\n", id);
+    // Gửi event lên MQTT nếu cần
+    break;
+
+  case FP_EVT_SHOW_ALL_DONE:
+    Serial.println("[FP] Show all IDs done");
+    // Gửi event lên MQTT nếu cần
+    evt.type = EVT_FP_SHOW_ALL_DONE;
+    evt.value = id;
+    xQueueSend(system_evt_queue, &evt, 0);
     break;
 
   case FP_EVT_SCAN_IDLE:
@@ -531,54 +516,53 @@ void fingerprint_event_handler(FingerprintEvent_t evt, uint16_t id)
     break;
 
   case FP_EVT_SCAN_SUCCESS:
-    if (sys_state == SYS_IDLE)
-    {
-      Serial.printf("Access granted, id=%d\n", id);
-      sys_state = SYS_UNLOCKED;
-      is_scanning = true;
-
-      // cmd = DOOR_REQUEST_UNLOCK;
-      // xQueueSend(door_cmd_queue, &cmd, 0);
-    }
+    Serial.printf("Access granted, id=%d\n", id);
+    // 👉 App layer quyết định mở cửa
+    cmd = DOOR_REQUEST_UNLOCK;
+    xQueueSend(door_cmd_queue, &cmd, 0);
+    evt.type = EVT_FP_MATCH;
+    evt.value = id;
+    xQueueSend(system_evt_queue, &evt, 0);
     break;
 
   case FP_EVT_SCAN_NOT_MATCH:
-    if (sys_state == SYS_IDLE)
-    {
-      Serial.println("Access denied, try again");
-    }
+    Serial.println("Access denied");
+    // Gửi event lên MQTT nếu cần
     break;
 
   case FP_EVT_SCAN_ERROR:
-    Serial.println("Fingerprint runtime error");
+    Serial.println("Fingerprint error");
+    // Gửi event lên MQTT nếu cần
     break;
 
   default:
     break;
   }
 }
-void mqtt_event_handler()
-{
-}
+
 void setup()
 {
   Serial.begin(115200);
+
+  // Create Queues
   door_cmd_queue = xQueueCreate(5, sizeof(DoorRequest_t));
   fp_request_queue = xQueueCreate(5, sizeof(FingerprintRequestMsg_t));
-  system_evt_queue = xQueueCreate(10, sizeof(SystemEvent_t)); // Queue này nên dài hơn chút
+  system_evt_queue = xQueueCreate(10, sizeof(SystemEvent_t));
   mqtt_payload_queue = xQueueCreate(5, sizeof(MqttMsg));
 
+  // Init Door
   door_register_event_callback(door_event_handler);
   door_init();
   door_start_task(door_cmd_queue, system_evt_queue);
 
-  // fingerprint_register_event_callback(fingerprint_event_handler);
-  // if (fingerprint_init())
-  // {
-  //   fingerprint_start_task(door_cmd_queue, system_evt_queue);
-  // }
-  WiFi.begin(ssid, password);
+  fingerprint_register_event_callback(fingerprint_event_handler);
 
+  if (fingerprint_init())
+  {
+    fingerprint_start_task(fp_request_queue);
+  }
+  // WiFi Connection
+  WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -589,6 +573,24 @@ void setup()
   Serial.print("Local IP: ");
   Serial.println(WiFi.localIP());
 
+  // === INIT TIME SYNC (NTP) ===
+  // Bước này sẽ cấu hình RTC nội tự động sync với server
+  Serial.println("Syncing time with NTP...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  // Chờ sync thời gian lần đầu (optional nhưng khuyến khích)
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo))
+  {
+    Serial.println("Time synced successfully!");
+    Serial.println(&timeinfo, "Current time: %A, %B %d %Y %H:%M:%S");
+  }
+  else
+  {
+    Serial.println("Time sync failed, will retry in background.");
+  }
+
+  // Init MQTT Mutex
   mqtt_client_mutex = xSemaphoreCreateMutex();
   if (mqtt_client_mutex == NULL)
   {
@@ -607,14 +609,8 @@ void setup()
   /* ========= CONNECT ========= */
   while (!client.connected())
   {
-    Serial.printf(
-        "MQTT connecting as %s...\n",
-        client_id.c_str());
-
-    if (client.connect(
-            client_id.c_str(),
-            mqtt_username,
-            mqtt_password))
+    Serial.printf("MQTT connecting as %s...\n", client_id.c_str());
+    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password))
     {
       Serial.println("MQTT broker connected");
     }
@@ -626,25 +622,19 @@ void setup()
     }
   }
 
-  /* ========= SUBSCRIBE COMMAND TOPIC ========= */
-  String cmd_topic =
-      String(topic_base) + "/" + client_id + "/command";
-
+  String cmd_topic = String(topic_base) + "/" + client_id + "/command";
   client.subscribe(cmd_topic.c_str());
-
   Serial.print("[MQTT] Subscribed: ");
   Serial.println(cmd_topic);
 
-  /* ========= OPTIONAL: ONLINE EVENT ========= */
-  String online_topic =
-      String(topic_base) + "/" + client_id + "/status";
-
+  String online_topic = String(topic_base) + "/" + client_id + "/status";
   client.publish(online_topic.c_str(), "online");
 
-  xTaskCreate(taskFingerprintMock, "fp_mock", 4096, NULL, 3, NULL);
-  xTaskCreatePinnedToCore(MqttControlTask, "MQTT's Command Control", 8198, NULL, 1, NULL, 1);
+  // Create Tasks
+  // xTaskCreate(taskFingerprintMock, "fp_mock", 4096, NULL, 3, NULL);
+  xTaskCreatePinnedToCore(MqttControlTask, "MQTT Cmd", 8198, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskMQTTClientLoop, "MQTT Loop", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskMqttPublish, "MQTT Publish", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskMqttPublish, "MQTT Pub", 4096, NULL, 1, NULL, 1);
 }
 
 void loop()

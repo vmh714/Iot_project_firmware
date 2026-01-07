@@ -10,11 +10,12 @@ typedef enum
     FP_EVT_INIT_FAIL, // verify password FAIL / sensor not respond
 
     // /* ===== RUNTIME EVENTS ===== */
-    // FP_EVT_IDLE,          // không có tay
-    // FP_EVT_FINGER_DETECT, // phát hiện có tay
-    // FP_EVT_MATCH,         // khớp vân tay
-    // FP_EVT_NOT_MATCH,     // không khớp
-    // FP_EVT_ERROR,          // lỗi khi chạy (comm, image fail...)
+    FP_EVT_ENROLL_DONE,
+    FP_EVT_DELETE_DONE,   // phát hiện có tay
+    FP_EVT_SHOW_ALL_DONE, // khớp vân tay
+    FP_EVT_ENROLL_START,  // không khớp
+    FP_EVT_ENROLL_STEP1_OK,
+    FP_EVT_ENROLL_STEP2_OK,
     FP_EVT_SCAN_IDLE,      // không có tay
     FP_EVT_SCAN_SUCCESS,   // tìm thấy ID
     FP_EVT_SCAN_NOT_MATCH, // vân tay không khớp
@@ -39,5 +40,5 @@ bool fingerprint_init(void);
 void fingerprint_scan_once(void);
 void fingerprint_poll(void);
 // Thay đổi hàm start để nhận 2 queue
-void fingerprint_start_task(QueueHandle_t door_queue, QueueHandle_t report_queue);
+void fingerprint_start_task(QueueHandle_t fp_request_queue);
 #endif

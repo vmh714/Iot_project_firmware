@@ -8,7 +8,7 @@
 #define FP_BAUDRATE 57600
 
 // Servo and door sensor
-#define SERVO_PIN 4
+#define SERVO_PIN 5
 #define SENSOR_PIN 15
 
 // Wifi
@@ -43,7 +43,7 @@ typedef enum
 typedef struct
 {
     SystemEventType_t type;
-    int value; // Ví dụ: ID vân tay, hoặc mã lỗi
+    uint16_t value; // Ví dụ: ID vân tay, hoặc mã lỗi
 } SystemEvent_t;
 
 enum DoorRequest_t
@@ -56,6 +56,8 @@ enum FingerprintRequest_t
     FP_REQUEST_ENROLL, // yêu cầu mở khoá
     FP_REQUEST_DELETE_ID,
     FP_REQUEST_SHOW_ALL_ID,
+    FP_REQ_SCAN_ENABLE,
+    FP_REQ_SCAN_DISABLE,
     FP_REQUEST_NONE // poll trạng thái cửa
 };
 typedef struct

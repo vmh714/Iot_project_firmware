@@ -34,7 +34,7 @@ void IRAM_ATTR door_sensor_isr()
 }
 void door_init()
 {
-    pinMode(SENSOR_PIN, INPUT);
+    pinMode(SENSOR_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), door_sensor_isr, CHANGE);
     door_servo.attach(SERVO_PIN);
     door_servo.write(0);

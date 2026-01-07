@@ -7,11 +7,11 @@
 
 static HardwareSerial FPSerial(FP_UART_NUM);
 static Adafruit_Fingerprint finger(&FPSerial);
-
+static bool scan_enabled = true;
 static fingerprint_event_cb_t fp_evt_cb = nullptr;
 static FP_InternalState_t fp_state = FP_IDLE;
 
-static QueueHandle_t _door_queue = NULL;   // Để ra lệnh mở
+static QueueHandle_t _fp_req_queue = NULL; // Để ra lệnh mở
 static QueueHandle_t _report_queue = NULL; // Để báo cáo lên MQTT
 
 void fingerprint_register_event_callback(fingerprint_event_cb_t cb)
@@ -50,132 +50,146 @@ static int scan_fingerprint_id()
 
     return finger.fingerID; // Thành công, trả về ID
 }
+static int enroll_fingerprint(uint16_t id)
+{
+    uint8_t p;
+
+    fingerprint_emit_event(FP_EVT_ENROLL_START, id);
+
+    /* ===== STEP 1: lấy ảnh lần 1 ===== */
+    while ((p = finger.getImage()) != FINGERPRINT_OK)
+    {
+        if (p == FINGERPRINT_NOFINGER)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        else
+            return -1;
+    }
+
+    p = finger.image2Tz(1);
+    if (p != FINGERPRINT_OK)
+        return -2;
+
+    fingerprint_emit_event(FP_EVT_ENROLL_STEP1_OK, id);
+
+    /* ===== yêu cầu nhấc tay ===== */
+    while (finger.getImage() != FINGERPRINT_NOFINGER)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* ===== STEP 2: lấy ảnh lần 2 ===== */
+    while ((p = finger.getImage()) != FINGERPRINT_OK)
+    {
+        if (p == FINGERPRINT_NOFINGER)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        else
+            return -3;
+    }
+
+    p = finger.image2Tz(2);
+    if (p != FINGERPRINT_OK)
+        return -4;
+
+    fingerprint_emit_event(FP_EVT_ENROLL_STEP2_OK, id);
+
+    /* ===== tạo model ===== */
+    p = finger.createModel();
+    if (p != FINGERPRINT_OK)
+        return -5;
+
+    /* ===== lưu model ===== */
+    p = finger.storeModel(id);
+    if (p != FINGERPRINT_OK)
+        return -6;
+
+    fingerprint_emit_event(FP_EVT_ENROLL_DONE, id);
+    return id;
+}
+
 bool fingerprint_init(void)
 {
     FPSerial.begin(FP_BAUDRATE, SERIAL_8N1, FP_RX_PIN, FP_TX_PIN);
     finger.begin(FP_BAUDRATE);
+
     if (finger.verifyPassword())
     {
         fingerprint_emit_event(FP_EVT_INIT_OK);
-        return false;
+        return true;
     }
     else
     {
         fingerprint_emit_event(FP_EVT_INIT_FAIL);
-    }
-    return true;
-}
-/*
-void fingerprint_scan_once(void)
-{
-    uint8_t p = finger.getImage();
-    // chờ có ngón tay
-    switch (fp_state)
-    {
-    case FP_IDLE:
-        if (p == FINGERPRINT_OK)
-        {
-            // phát hiện CẠNH: tay vừa đặt
-            fp_state = FP_SCANNING;
-        }
-        fingerprint_emit_event(FP_EVT_SCAN_IDLE, 0);
-        break;
-
-    case FP_SCANNING:
-    {
-        int result = scan_fingerprint_id();
-
-        if (result >= 0)
-        {
-            fingerprint_emit_event(FP_EVT_SCAN_SUCCESS, result);
-            fp_state = FP_WAIT_REMOVE;
-        }
-        else if (result == -3)
-        {
-            fingerprint_emit_event(FP_EVT_SCAN_NOT_MATCH);
-            fp_state = FP_WAIT_REMOVE;
-        }
-        else
-        {
-            fingerprint_emit_event(FP_EVT_SCAN_ERROR);
-            fp_state = FP_WAIT_REMOVE;
-        }
-        break;
-    }
-
-    case FP_WAIT_REMOVE:
-        if (p == FINGERPRINT_NOFINGER)
-        {
-            // phát hiện CẠNH: tay nhấc lên
-            fp_state = FP_IDLE;
-        }
-        break;
-
-    default:
-        fp_state = FP_IDLE;
-        break;
+        return false;
     }
 }
-*/
+
 void fingerprint_poll()
 {
 }
 static void taskFingerprint(void *pv)
 {
-    FP_InternalState_t state = FP_IDLE;
+    FingerprintRequestMsg_t req;
     uint8_t p;
     int id;
 
     for (;;)
     {
-        p = finger.getImage();
-
-        switch (state)
+        /* ===== 1. Handle REQUEST ===== */
+        if (xQueueReceive(_fp_req_queue, &req, 0) == pdTRUE)
         {
-        case FP_IDLE:
-            if (p == FINGERPRINT_OK)
-                state = FP_SCANNING;
-            break;
-
-        case FP_SCANNING:
-            id = scan_fingerprint_id();
-            if (id >= 0)
+            switch (req.type)
             {
-                DoorRequest_t cmd = DOOR_REQUEST_UNLOCK;
-                xQueueSend(_door_queue, &cmd, 0);
+            case FP_REQUEST_ENROLL:
+                id = enroll_fingerprint(req.id);
+                fingerprint_emit_event(FP_EVT_ENROLL_DONE, id);
+                break;
 
-                // MQTT report
-                // SystemEvent_t evt = {EVT_FP_MATCH, id};
-                // xQueueSend(_report_queue, &evt, 0);
+            case FP_REQUEST_DELETE_ID:
+                finger.deleteModel(req.id);
+                fingerprint_emit_event(FP_EVT_DELETE_DONE, req.id);
+                break;
 
-                state = FP_WAIT_REMOVE;
-            }
-            else if (id == -3)
-            {
-                // EVT_FP_UNKNOWN
-                state = FP_WAIT_REMOVE;
-            }
-            else
-            {
-                // EVT_FP_ERROR
-                state = FP_WAIT_REMOVE;
-            }
-            break;
+            case FP_REQUEST_SHOW_ALL_ID:
+                finger.getTemplateCount();
+                fingerprint_emit_event(FP_EVT_SHOW_ALL_DONE, finger.templateCount);
+                break;
 
-        case FP_WAIT_REMOVE:
-            if (p == FINGERPRINT_NOFINGER)
-                state = FP_IDLE;
-            break;
+            case FP_REQ_SCAN_ENABLE:
+                scan_enabled = true;
+                break;
+
+            case FP_REQ_SCAN_DISABLE:
+                scan_enabled = false;
+                break;
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        /* ===== 2. Runtime SCAN ===== */
+        if (!scan_enabled)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        p = finger.getImage();
+        if (p == FINGERPRINT_OK)
+        {
+            id = scan_fingerprint_id();
+            if (id >= 0)
+                fingerprint_emit_event(FP_EVT_SCAN_SUCCESS, id);
+            else
+                fingerprint_emit_event(FP_EVT_SCAN_NOT_MATCH);
+
+            wait_finger_removed();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 }
 
-void fingerprint_start_task(QueueHandle_t door_queue, QueueHandle_t report_queue)
+void fingerprint_start_task(QueueHandle_t fp_request_queue)
 {
-    _door_queue = door_queue;
-    _report_queue = report_queue;
+    _fp_req_queue = fp_request_queue;
     xTaskCreatePinnedToCore(
         taskFingerprint,
         "TaskFingerprint",
@@ -183,6 +197,5 @@ void fingerprint_start_task(QueueHandle_t door_queue, QueueHandle_t report_queue
         NULL,
         TASK_FP_PRIORITY,
         NULL,
-        1 // core 1 (core 0 để WiFi/MQTT)
-    );
+        1);
 }
