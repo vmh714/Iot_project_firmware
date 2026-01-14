@@ -19,7 +19,8 @@ typedef enum
     FP_EVT_SCAN_IDLE,      // không có tay
     FP_EVT_SCAN_SUCCESS,   // tìm thấy ID
     FP_EVT_SCAN_NOT_MATCH, // vân tay không khớp
-    FP_EVT_SCAN_ERROR      // lỗi kỹ thuật
+    FP_EVT_DUPLICATE_FOUND,
+    FP_EVT_SCAN_ERROR // lỗi kỹ thuật
 } FingerprintEvent_t;
 
 typedef enum
@@ -32,8 +33,7 @@ typedef enum
 
 typedef void (*fingerprint_event_cb_t)(
     FingerprintEvent_t evt,
-    uint16_t finger_id // chỉ dùng cho FP_EVT_MATCH
-);
+    int16_t finger_id);
 void fingerprint_register_event_callback(fingerprint_event_cb_t cb);
 
 bool fingerprint_init(void);

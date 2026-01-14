@@ -2,14 +2,12 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <LiquidCrystal_I2C.h>
 #include "time.h" // Thư viện native để xử lý RTC nội và NTP
 
 #include "app_config.h"
 #include "door.h"
 #include "fingerprint.h"
-
-// TaskHandle_t task_fp_handle = NULL;
-// TaskHandle_t task_door_handle = NULL;
 
 QueueHandle_t door_cmd_queue;   // Queue lệnh
 QueueHandle_t fp_request_queue; // Queue lệnh cho fp
@@ -19,10 +17,6 @@ SemaphoreHandle_t mqtt_client_mutex;
 
 static SystemState_t sys_state = SYS_IDLE;
 static bool is_scanning = true;
-
-// WiFi
-const char *ssid = "IT Hoc Bach Khoa";        // Enter your Wi-Fi name
-const char *password = "chungtalamotgiadinh"; // Enter Wi-Fi password
 
 // NTP Server Configuration
 const char *ntpServer = "in.pool.ntp.org";
@@ -35,6 +29,9 @@ const char *topic_base = "esp32/vmh-test";
 const char *mqtt_username = "emqx-vmh-test";
 const char *mqtt_password = "public";
 const int mqtt_port = 1883;
+
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+QueueHandle_t lcd_queue;
 
 String client_id = "esp32-client-";
 WiFiClient espClient;
@@ -70,7 +67,8 @@ const char *event_to_topic(SystemEventType_t type)
   case EVT_FP_MATCH:
   case EVT_FP_UNKNOWN:
   case EVT_FP_ERROR:
-  case EVT_FP_ENROLL_DONE:
+  case EVT_FP_ENROLL_SUCCESS:
+  case EVT_FP_ENROLL_FAIL:
   case EVT_FP_DELETE_DONE:
   case EVT_FP_SHOW_ALL_DONE:
     return "fingerprint";
@@ -78,7 +76,8 @@ const char *event_to_topic(SystemEventType_t type)
   case EVT_DOOR_UNLOCKED_WAIT_OPEN:
   case EVT_DOOR_OPEN:
     return "door";
-
+  case EVT_STATUS_ONLINE:
+    return "status";
   default:
     return nullptr;
   }
@@ -112,11 +111,279 @@ void callback(char *topic, byte *payload, unsigned int length)
   Serial.print("[MQTT] Command received: ");
   Serial.println(msg.payload);
 }
+void send_lcd_message(LcdMessageType_t type, const char *l1, const char *l2, uint32_t duration)
+{
+  LcdEvent_t evt;
+  evt.type = type;
+  evt.duration = duration;
 
+  // Copy chuỗi an toàn, tránh tràn bộ nhớ
+  strncpy(evt.line1, l1, sizeof(evt.line1) - 1);
+  evt.line1[sizeof(evt.line1) - 1] = '\0';
+
+  strncpy(evt.line2, l2, sizeof(evt.line2) - 1);
+  evt.line2[sizeof(evt.line2) - 1] = '\0';
+
+  // Gửi vào queue (wait 0 để không treo callback nếu queue đầy)
+  xQueueSend(lcd_queue, &evt, 0);
+}
+
+void door_event_handler(DoorEvent_t res)
+{
+  SystemEvent_t evt;
+  evt.value = 0;
+  Serial.print("DOOR ");
+  switch (res)
+  {
+  case DOOR_EVT_UNLOCKED:
+    Serial.println("Door has been unlocked!");
+    sys_state = SYS_IDLE;
+    evt.type = EVT_DOOR_UNLOCKED_WAIT_OPEN;
+    xQueueSend(system_evt_queue, &evt, 0);
+    break;
+  case DOOR_EVT_OPENED:
+    Serial.println("Door opened");
+    send_lcd_message(LCD_MSG_DOOR_OPEN, "DOOR OPENED", "Be Careful", 3000);
+    sys_state = SYS_DOOR_OPEN;
+    evt.type = EVT_DOOR_OPEN;
+    xQueueSend(system_evt_queue, &evt, 0);
+    break;
+  case DOOR_EVT_CLOSED_AND_LOCKED:
+    send_lcd_message(LCD_MSG_IDLE, "Door Locked", "\0", 0);
+    Serial.println("Door closed and locked");
+    sys_state = SYS_IDLE;
+    evt.type = EVT_DOOR_LOCKED;
+    xQueueSend(system_evt_queue, &evt, 0);
+    break;
+  case DOOR_EVT_WAIT_TIME_END_AND_LOCKED:
+    send_lcd_message(LCD_MSG_IDLE, "Door auto-locked", "after timeout", 0);
+    Serial.println("Door auto-locked after timeout");
+    sys_state = SYS_IDLE;
+    evt.type = EVT_DOOR_LOCKED;
+    xQueueSend(system_evt_queue, &evt, 0);
+    break;
+  default:
+    break;
+  }
+}
+const char *fingerprint_enroll_fault_handler(int16_t err)
+{
+  switch (err)
+  {
+  case -1:
+    Serial.println("[FP][ENROLL] Step 1: Failed to get image");
+    return "ENROLL_FAIL_STEP1_GET_IMAGE";
+
+  case -2:
+    Serial.println("[FP][ENROLL] Step 1: image2Tz(1) failed");
+    return "ENROLL_FAIL_STEP1_IMAGE_CONVERT";
+
+  case -3:
+    Serial.println("[FP][ENROLL] Step 2: Failed to get image");
+    return "ENROLL_FAIL_STEP2_GET_IMAGE";
+
+  case -4:
+    Serial.println("[FP][ENROLL] Step 2: image2Tz(2) failed");
+    return "ENROLL_FAIL_STEP2_IMAGE_CONVERT";
+
+  case -5:
+    Serial.println("[FP][ENROLL] createModel() failed");
+    return "ENROLL_FAIL_CREATE_MODEL";
+
+  case -6:
+    Serial.println("[FP][ENROLL] storeModel() failed");
+    return "ENROLL_FAIL_STORE_MODEL";
+  case -100:
+    Serial.println("[FP][ENROLL] Duplicate found");
+    return "ENROLL_FAIL_DUPLICATE_FOUND";
+  default:
+    Serial.print("[FP][ENROLL] Unknown error code: ");
+    Serial.println(err);
+    return "ENROLL_FAIL_UNKNOWN";
+  }
+}
+
+void fingerprint_event_handler(FingerprintEvent_t res, int16_t id)
+{
+  DoorRequest_t cmd;
+  SystemEvent_t evt;
+  char buff[16];
+  switch (res)
+  {
+  case FP_EVT_INIT_OK:
+    Serial.println("[FP] Sensor ready");
+    break;
+
+  case FP_EVT_INIT_FAIL:
+    Serial.println("[FP] Sensor init failed");
+    break;
+
+  case FP_EVT_ENROLL_START:
+    snprintf(buff, sizeof(buff), "Enroll ID: %d", id);
+    Serial.printf("[FP] Start enrolling finger id=%d\n", id);
+    send_lcd_message(LCD_MSG_INFO, "Place Finger", buff, 0);
+    break;
+
+  case FP_EVT_ENROLL_STEP1_OK:
+    Serial.printf("[FP] Step 1 OK for finger id=%d. Please lift your finger.\n", id);
+    send_lcd_message(LCD_MSG_INFO, "Step 1 OK", "Lift Finger Now", 2000);
+    break;
+
+  case FP_EVT_ENROLL_STEP2_OK:
+    Serial.printf("[FP] Step 2 OK for finger id=%d. Creating model...\n", id);
+    send_lcd_message(LCD_MSG_INFO, "Step 2 OK", "Processing...", 1000);
+    break;
+
+  case FP_EVT_ENROLL_DONE:
+    if (id >= 0)
+    {
+      Serial.printf("[FP] Enroll done for finger id=%d\n", id);
+      send_lcd_message(LCD_MSG_SUCCESS, "Enroll Done!", "Success", 2000);
+      evt.type = EVT_FP_ENROLL_SUCCESS;
+      evt.value = id;
+      xQueueSend(system_evt_queue, &evt, 0);
+    }
+    else
+    {
+      Serial.printf("[FP] Enroll fail! ERROR Code: %d\n", id);
+      send_lcd_message(LCD_MSG_ERROR, "Enroll Failed", "Error", 2000);
+      evt.type = EVT_FP_ENROLL_FAIL;
+      xQueueSend(system_evt_queue, &evt, 0);
+    }
+    // Gửi event lên MQTT nếu cần
+    break;
+
+  case FP_EVT_DELETE_DONE:
+    Serial.printf("[FP] Delete done for finger id=%d\n", id);
+    // Gửi event lên MQTT nếu cần
+    break;
+
+  case FP_EVT_SHOW_ALL_DONE:
+    Serial.println("[FP] Show all IDs done");
+    // Gửi event lên MQTT nếu cần
+    evt.type = EVT_FP_SHOW_ALL_DONE;
+    evt.value = id;
+    xQueueSend(system_evt_queue, &evt, 0);
+    break;
+
+  case FP_EVT_SCAN_IDLE:
+    if (is_scanning)
+    {
+      Serial.println("Please scan your fingerprint");
+      is_scanning = false;
+    }
+    break;
+
+  case FP_EVT_SCAN_SUCCESS:
+    snprintf(buff, sizeof(buff), "ID: %d", id);
+    Serial.printf("Access granted, id=%d\n", id);
+    send_lcd_message(LCD_MSG_SUCCESS, "Access Granted", buff, 3000);
+    cmd = DOOR_REQUEST_UNLOCK;
+    xQueueSend(door_cmd_queue, &cmd, 0);
+    evt.type = EVT_FP_MATCH;
+    evt.value = id;
+    xQueueSend(system_evt_queue, &evt, 0);
+    break;
+
+  case FP_EVT_SCAN_NOT_MATCH:
+    Serial.println("Access denied");
+    send_lcd_message(LCD_MSG_ERROR, "Access Denied", "Try Again", 2000);
+    break;
+
+  case FP_EVT_SCAN_ERROR:
+    Serial.println("Fingerprint error");
+    // Gửi event lên MQTT nếu cần
+    break;
+
+  default:
+    break;
+  }
+}
+void TaskLCD(void *pvParameters)
+{
+  LcdEvent_t msg;
+
+  // Khởi tạo LCD
+  lcd.init();
+  lcd.backlight();
+
+  // Hiển thị màn hình khởi động
+  lcd.setCursor(0, 0);
+  lcd.print("System Booting..");
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // Trạng thái nội bộ để quản lý việc tự động quay về IDLE
+  unsigned long last_temp_msg_time = 0;
+  bool is_showing_temp_msg = false;
+  uint32_t current_msg_duration = 0;
+
+  // Gửi lệnh IDLE ban đầu
+  LcdEvent_t idleMsg;
+  idleMsg.type = LCD_MSG_IDLE;
+  strcpy(idleMsg.line1, "IoT Smart Door");
+  strcpy(idleMsg.line2, "Ready to scan...");
+  idleMsg.duration = 0;
+
+  // Vẽ màn hình IDLE ngay lập tức
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(idleMsg.line1);
+  lcd.setCursor(0, 1);
+  lcd.print(idleMsg.line2);
+
+  for (;;)
+  {
+    // 1. Kiểm tra xem có tin nhắn mới trong Queue không (Non-blocking hoặc wait ngắn)
+    if (xQueueReceive(lcd_queue, &msg, pdMS_TO_TICKS(100)))
+    {
+
+      // Xóa màn hình và in nội dung mới
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(msg.line1);
+      lcd.setCursor(0, 1);
+      lcd.print(msg.line2);
+
+      // Nếu đây là tin nhắn tạm thời (có duration > 0)
+      if (msg.duration > 0)
+      {
+        is_showing_temp_msg = true;
+        current_msg_duration = msg.duration;
+        last_temp_msg_time = millis();
+      }
+      else
+      {
+        // Nếu là tin nhắn vĩnh viễn (ví dụ IDLE update), tắt cờ tạm
+        is_showing_temp_msg = false;
+      }
+    }
+
+    // 2. Logic tự động quay về màn hình chờ (IDLE) sau khi hiển thị thông báo xong
+    if (is_showing_temp_msg)
+    {
+      if (millis() - last_temp_msg_time > current_msg_duration)
+      {
+        is_showing_temp_msg = false;
+
+        // Quay về màn hình chờ mặc định
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("IoT Smart Door");
+
+        // Dòng 2 hiển thị giờ (nếu có thể lấy từ hàm get_iso_timestamp hoặc đơn giản là text)
+        lcd.setCursor(0, 1);
+        lcd.print("Please Scan...");
+      }
+    }
+
+    // Delay nhẹ để nhường CPU
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
 void MqttControlTask(void *pvParameter)
 {
   MqttMsg msg;
-
+  Serial.println("[MQTT] Control task started");
   while (1)
   {
     if (xQueueReceive(mqtt_payload_queue, &msg, portMAX_DELAY))
@@ -189,6 +456,14 @@ void MqttControlTask(void *pvParameter)
         xQueueSend(fp_request_queue, &req, 0);
         Serial.println("[MQTT CTRL] FP show all IDs request");
       }
+      else if (strcasecmp(cmd, "device_get_status") == 0)
+      {
+
+        SystemEvent_t req;
+        req.type = EVT_STATUS_ONLINE;
+        xQueueSend(system_evt_queue, &req, 0);
+        Serial.println("[MQTT CTRL] get device's status request");
+      }
       else
       {
         Serial.print("[MQTT CTRL] Unknown cmd: ");
@@ -204,10 +479,13 @@ void TaskMQTTClientLoop(void *pvParameters)
 
   String cmd_topic;
   String status_topic;
+  SystemEvent_t req;
 
   cmd_topic = String(topic_base) + "/" + client_id + "/command";
   status_topic = String(topic_base) + "/" + client_id + "/status";
+  static unsigned long last_heartbeat_time = 0;
 
+  Serial.println("[MQTT] Client Loop task started");
   while (1)
   {
     if (xSemaphoreTake(mqtt_client_mutex, pdMS_TO_TICKS(2000)))
@@ -220,7 +498,10 @@ void TaskMQTTClientLoop(void *pvParameters)
         {
           Serial.println("[MQTT] Reconnected");
           client.subscribe(cmd_topic.c_str());
-          client.publish(status_topic.c_str(), "online");
+
+          req.type = EVT_STATUS_ONLINE;
+          xQueueSend(system_evt_queue, &req, 0);
+
           Serial.print("[MQTT] Subscribed: ");
           Serial.println(cmd_topic);
         }
@@ -235,6 +516,16 @@ void TaskMQTTClientLoop(void *pvParameters)
       }
       xSemaphoreGive(mqtt_client_mutex);
     }
+    if (millis() - last_heartbeat_time > 60000)
+    {
+      last_heartbeat_time = millis();
+
+      SystemEvent_t hb_req;
+      hb_req.type = EVT_STATUS_ONLINE;
+      xQueueSend(system_evt_queue, &hb_req, 0);
+
+      Serial.println("[MQTT LOOP] Triggered 60s Heartbeat");
+    }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -242,7 +533,7 @@ void TaskMQTTClientLoop(void *pvParameters)
 void TaskMqttPublish(void *pvParameter)
 {
   SystemEvent_t evt;
-  char payload[256]; // Tăng kích thước buffer để chứa chuỗi thời gian
+  char payload[256]; // buffer để chứa chuỗi thời gian
 
   Serial.println("[MQTT] Publish task started");
 
@@ -274,9 +565,13 @@ void TaskMqttPublish(void *pvParameter)
       case EVT_FP_ERROR:
         doc["event"] = "fp_error";
         break;
-      case EVT_FP_ENROLL_DONE:
-        doc["event"] = "fp_enroll_done";
+      case EVT_FP_ENROLL_SUCCESS:
+        doc["event"] = "fp_enroll_success";
         doc["finger_id"] = evt.value;
+        break;
+      case EVT_FP_ENROLL_FAIL:
+        doc["event"] = "fp_enroll_fail";
+        doc["payload"] = fingerprint_enroll_fault_handler(evt.value);
         break;
       case EVT_FP_DELETE_DONE:
         doc["event"] = "fp_delete_done";
@@ -301,6 +596,11 @@ void TaskMqttPublish(void *pvParameter)
       case EVT_DOOR_OPEN:
         doc["event"] = "door_state";
         doc["state"] = "open";
+        break;
+
+      case EVT_STATUS_ONLINE:
+        doc["event"] = "device_status";
+        doc["status"] = "online";
         break;
 
       default:
@@ -335,7 +635,6 @@ void TaskMqttPublish(void *pvParameter)
   }
 }
 
-// ... (Giữ nguyên phần taskFingerprintMock và các handler khác) ...
 // void taskFingerprintMock(void *pv)
 // {
 //   FingerprintRequestMsg_t req;
@@ -425,121 +724,6 @@ void TaskMqttPublish(void *pvParameter)
 //   }
 // }
 
-void door_event_handler(DoorEvent_t res)
-{
-  SystemEvent_t evt;
-  evt.value = 0;
-  switch (res)
-  {
-  case DOOR_EVT_UNLOCKED:
-    Serial.println("Door has been unlocked!");
-    sys_state = SYS_IDLE;
-    evt.type = EVT_DOOR_UNLOCKED_WAIT_OPEN;
-    xQueueSend(system_evt_queue, &evt, 0);
-    break;
-  case DOOR_EVT_OPENED:
-    Serial.println("Door opened");
-    sys_state = SYS_DOOR_OPEN;
-    evt.type = EVT_DOOR_OPEN;
-    xQueueSend(system_evt_queue, &evt, 0);
-    break;
-  case DOOR_EVT_CLOSED_AND_LOCKED:
-    Serial.println("Door closed and locked");
-    sys_state = SYS_IDLE;
-    evt.type = EVT_DOOR_LOCKED;
-    xQueueSend(system_evt_queue, &evt, 0);
-    break;
-  case DOOR_EVT_WAIT_TIME_END_AND_LOCKED:
-    Serial.println("Door auto-locked after timeout");
-    sys_state = SYS_IDLE;
-    evt.type = EVT_DOOR_LOCKED;
-    xQueueSend(system_evt_queue, &evt, 0);
-    break;
-  default:
-    break;
-  }
-}
-void fingerprint_event_handler(FingerprintEvent_t res, uint16_t id)
-{
-  DoorRequest_t cmd;
-  SystemEvent_t evt;
-
-  switch (res)
-  {
-  case FP_EVT_INIT_OK:
-    Serial.println("[FP] Sensor ready");
-    break;
-
-  case FP_EVT_INIT_FAIL:
-    Serial.println("[FP] Sensor init failed");
-    break;
-
-  case FP_EVT_ENROLL_START:
-    Serial.printf("[FP] Start enrolling finger id=%d\n", id);
-    break;
-
-  case FP_EVT_ENROLL_STEP1_OK:
-    Serial.printf("[FP] Step 1 OK for finger id=%d. Please lift your finger.\n", id);
-    break;
-
-  case FP_EVT_ENROLL_STEP2_OK:
-    Serial.printf("[FP] Step 2 OK for finger id=%d. Creating model...\n", id);
-    break;
-
-  case FP_EVT_ENROLL_DONE:
-    Serial.printf("[FP] Enroll done for finger id=%d\n", id);
-    evt.type = EVT_FP_ENROLL_DONE;
-    evt.value = id;
-    xQueueSend(system_evt_queue, &evt, 0);
-    // Gửi event lên MQTT nếu cần
-    break;
-
-  case FP_EVT_DELETE_DONE:
-    Serial.printf("[FP] Delete done for finger id=%d\n", id);
-    // Gửi event lên MQTT nếu cần
-    break;
-
-  case FP_EVT_SHOW_ALL_DONE:
-    Serial.println("[FP] Show all IDs done");
-    // Gửi event lên MQTT nếu cần
-    evt.type = EVT_FP_SHOW_ALL_DONE;
-    evt.value = id;
-    xQueueSend(system_evt_queue, &evt, 0);
-    break;
-
-  case FP_EVT_SCAN_IDLE:
-    if (is_scanning)
-    {
-      Serial.println("Please scan your fingerprint");
-      is_scanning = false;
-    }
-    break;
-
-  case FP_EVT_SCAN_SUCCESS:
-    Serial.printf("Access granted, id=%d\n", id);
-    // 👉 App layer quyết định mở cửa
-    cmd = DOOR_REQUEST_UNLOCK;
-    xQueueSend(door_cmd_queue, &cmd, 0);
-    evt.type = EVT_FP_MATCH;
-    evt.value = id;
-    xQueueSend(system_evt_queue, &evt, 0);
-    break;
-
-  case FP_EVT_SCAN_NOT_MATCH:
-    Serial.println("Access denied");
-    // Gửi event lên MQTT nếu cần
-    break;
-
-  case FP_EVT_SCAN_ERROR:
-    Serial.println("Fingerprint error");
-    // Gửi event lên MQTT nếu cần
-    break;
-
-  default:
-    break;
-  }
-}
-
 void setup()
 {
   Serial.begin(115200);
@@ -549,6 +733,7 @@ void setup()
   fp_request_queue = xQueueCreate(5, sizeof(FingerprintRequestMsg_t));
   system_evt_queue = xQueueCreate(10, sizeof(SystemEvent_t));
   mqtt_payload_queue = xQueueCreate(5, sizeof(MqttMsg));
+  lcd_queue = xQueueCreate(5, sizeof(LcdEvent_t));
 
   // Init Door
   door_register_event_callback(door_event_handler);
@@ -561,9 +746,12 @@ void setup()
   {
     fingerprint_start_task(fp_request_queue);
   }
+  xTaskCreatePinnedToCore(TaskLCD, "TaskLCD", 3072, NULL, 1, NULL, 1);
+
   // WiFi Connection
-  WiFi.begin(ssid, password);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Connecting to WiFi");
+  send_lcd_message(LCD_MSG_INFO, "Connecting...", "WiFi Network", 0);
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
@@ -572,6 +760,7 @@ void setup()
   Serial.println("\nWiFi connected!");
   Serial.print("Local IP: ");
   Serial.println(WiFi.localIP());
+  send_lcd_message(LCD_MSG_INFO, "WiFi Connected", WiFi.localIP().toString().c_str(), 2000);
 
   // === INIT TIME SYNC (NTP) ===
   // Bước này sẽ cấu hình RTC nội tự động sync với server
@@ -628,7 +817,10 @@ void setup()
   Serial.println(cmd_topic);
 
   String online_topic = String(topic_base) + "/" + client_id + "/status";
-  client.publish(online_topic.c_str(), "online");
+  SystemEvent_t evt;
+  evt.type = EVT_STATUS_ONLINE;
+  evt.value = 0;
+  xQueueSend(system_evt_queue, &evt, 0);
 
   // Create Tasks
   // xTaskCreate(taskFingerprintMock, "fp_mock", 4096, NULL, 3, NULL);

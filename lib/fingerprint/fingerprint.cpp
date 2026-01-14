@@ -69,6 +69,16 @@ static int enroll_fingerprint(uint16_t id)
     if (p != FINGERPRINT_OK)
         return -2;
 
+    /* ===== 🔴 CHECK DUPLICATE ===== */
+    p = finger.fingerSearch();
+    if (p == FINGERPRINT_OK)
+    {
+        // Đã tồn tại vân tay này
+        // finger.fingerID là ID cũ
+        fingerprint_emit_event(FP_EVT_DUPLICATE_FOUND, finger.fingerID);
+        return -100; // duplicate fingerprint
+    }
+
     fingerprint_emit_event(FP_EVT_ENROLL_STEP1_OK, id);
 
     /* ===== yêu cầu nhấc tay ===== */
@@ -89,6 +99,15 @@ static int enroll_fingerprint(uint16_t id)
     p = finger.image2Tz(2);
     if (p != FINGERPRINT_OK)
         return -4;
+
+    p = finger.fingerSearch();
+    if (p == FINGERPRINT_OK)
+    {
+        // Đã tồn tại vân tay này
+        // finger.fingerID là ID cũ
+        fingerprint_emit_event(FP_EVT_DUPLICATE_FOUND, finger.fingerID);
+        return -100; // duplicate fingerprint
+    }
 
     fingerprint_emit_event(FP_EVT_ENROLL_STEP2_OK, id);
 
@@ -132,7 +151,7 @@ static void taskFingerprint(void *pv)
     uint8_t p;
     int id;
 
-    for (;;)
+    while (1)
     {
         /* ===== 1. Handle REQUEST ===== */
         if (xQueueReceive(_fp_req_queue, &req, 0) == pdTRUE)

@@ -11,6 +11,9 @@
 #define SERVO_PIN 5
 #define SENSOR_PIN 15
 
+#define LCD_ADDR 0x27
+#define LCD_COLS 16
+#define LCD_ROWS 2
 // Wifi
 #define WIFI_SSID "IT Hoc Bach Khoa"
 #define WIFI_PASS "chungtalamotgiadinh"
@@ -32,18 +35,20 @@ typedef enum
     EVT_FP_MATCH,   // Quét đúng vân tay
     EVT_FP_UNKNOWN, // Quét sai/không có trong db
     EVT_FP_ERROR,
-    EVT_FP_ENROLL_DONE,
+    EVT_FP_ENROLL_SUCCESS,
+    EVT_FP_ENROLL_FAIL,
     EVT_FP_DELETE_DONE,
     EVT_FP_SHOW_ALL_DONE,
     EVT_DOOR_LOCKED,
     EVT_DOOR_UNLOCKED_WAIT_OPEN, // unlock nhưng chưa mở
-    EVT_DOOR_OPEN
+    EVT_DOOR_OPEN,
+    EVT_STATUS_ONLINE
 } SystemEventType_t;
 
 typedef struct
 {
     SystemEventType_t type;
-    uint16_t value; // Ví dụ: ID vân tay, hoặc mã lỗi
+    int16_t value; // Ví dụ: ID vân tay, hoặc mã lỗi
 } SystemEvent_t;
 
 enum DoorRequest_t
@@ -71,5 +76,23 @@ typedef enum
     SYS_UNLOCKED,  // đã unlock, chờ mở cửa
     SYS_DOOR_OPEN, // cửa đang mở
 } SystemState_t;
+
+// --- ENUM & STRUCT CHO LCD ---
+enum LcdMessageType_t
+{
+    LCD_MSG_IDLE,     // Màn hình chờ (hiển thị giờ hoặc dòng chữ Ready)
+    LCD_MSG_INFO,     // Thông báo chung (WiFi connecting...)
+    LCD_MSG_SUCCESS,  // Mở cửa thành công
+    LCD_MSG_ERROR,    // Sai vân tay / Lỗi
+    LCD_MSG_DOOR_OPEN // Cửa đang mở
+};
+
+struct LcdEvent_t
+{
+    LcdMessageType_t type;
+    char line1[17]; // Buffer tĩnh 17 ký tự (16 char + null)
+    char line2[17];
+    uint32_t duration; // Thời gian hiển thị (ms), sau đó tự về IDLE. 0 = vĩnh viễn
+};
 
 #endif
