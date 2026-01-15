@@ -149,14 +149,14 @@ void door_event_handler(DoorEvent_t res)
     xQueueSend(system_evt_queue, &evt, 0);
     break;
   case DOOR_EVT_CLOSED_AND_LOCKED:
-    send_lcd_message(LCD_MSG_IDLE, "Door Locked", "\0", 0);
+    send_lcd_message(LCD_MSG_IDLE, "Door Locked", "\0", 2000);
     Serial.println("Door closed and locked");
     sys_state = SYS_IDLE;
     evt.type = EVT_DOOR_LOCKED;
     xQueueSend(system_evt_queue, &evt, 0);
     break;
   case DOOR_EVT_WAIT_TIME_END_AND_LOCKED:
-    send_lcd_message(LCD_MSG_IDLE, "Door auto-locked", "after timeout", 0);
+    send_lcd_message(LCD_MSG_IDLE, "Door auto-locked", "after timeout", 2000);
     Serial.println("Door auto-locked after timeout");
     sys_state = SYS_IDLE;
     evt.type = EVT_DOOR_LOCKED;
