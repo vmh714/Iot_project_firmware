@@ -1,11 +1,3 @@
-# Iot_project_firmware
-Dưới đây là nội dung file `README.md` chuyên nghiệp, đầy đủ và chi tiết dựa trên mã nguồn bạn cung cấp. Nó làm nổi bật kiến trúc **FreeRTOS** và **Event-Driven** mà bạn đã áp dụng.
-
-Bạn có thể copy nội dung bên dưới và tạo file `README.md` trong thư mục gốc của repo nhé.
-
----
-
-```markdown
 # IoT Smart Door & Attendance System Firmware 🔒🖐️
 
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-Build-orange.svg)](https://platformio.org/)
