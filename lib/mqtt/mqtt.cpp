@@ -17,10 +17,6 @@ static QueueHandle_t fp_request_queue = NULL;
 static SemaphoreHandle_t mqtt_client_mutex;
 static String client_id;
 
-const char *topic_base = "esp32/vmh-test";
-const char *mqtt_username = "emqx-vmh-test";
-const char *mqtt_password = "public";
-
 void mqtt_register_event_callback(mqtt_event_cb_t cb)
 {
     mqtt_evt_cb = cb;
@@ -33,7 +29,7 @@ static void callback(char *topic, byte *payload, unsigned int length)
       expect_topic,
       sizeof(expect_topic),
       "%s/%s/command",
-      topic_base,
+      MQTT_TOPIC_BASE,
       client_id.c_str());
 
   if (strcmp(topic, expect_topic) != 0)
@@ -158,8 +154,8 @@ static void TaskMQTTClientLoop(void *pvParameters)
   String status_topic;
   SystemEvent_t req;
 
-  cmd_topic = String(topic_base) + "/" + client_id + "/command";
-  status_topic = String(topic_base) + "/" + client_id + "/status";
+  cmd_topic = String(MQTT_TOPIC_BASE) + "/" + client_id + "/command";
+  status_topic = String(MQTT_TOPIC_BASE) + "/" + client_id + "/status";
   static unsigned long last_heartbeat_time = 0;
 
   Serial.println("[MQTT] Client Loop task started");
@@ -171,7 +167,7 @@ static void TaskMQTTClientLoop(void *pvParameters)
       {
         Serial.println("[MQTT] Not connected, reconnecting...");
 
-        if (mqtt.connect(client_id.c_str(), mqtt_username, mqtt_password))
+        if (mqtt.connect(client_id.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
         {
           Serial.println("[MQTT] Reconnected");
           mqtt.subscribe(cmd_topic.c_str());
@@ -282,7 +278,7 @@ static void TaskMqttPublish(void *pvParameter)
           const char *category = event_to_topic(evt.type);
           if (category)
           {
-            String full_topic = String(topic_base) + "/" + client_id + "/" + category;
+            String full_topic = String(MQTT_TOPIC_BASE) + "/" + client_id + "/" + category;
             mqtt.publish(full_topic.c_str(), payload);
 
             Serial.print("[MQTT] Published to ");
@@ -319,7 +315,7 @@ bool mqtt_init(void)
     while (!mqtt.connected())
     {
         Serial.printf("MQTT connecting as %s...\n", client_id.c_str());
-        if (mqtt.connect(client_id.c_str(), mqtt_username, mqtt_password))
+        if (mqtt.connect(client_id.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
         {
             Serial.println("MQTT broker connected");
         }
@@ -331,7 +327,7 @@ bool mqtt_init(void)
         }
     }
 
-    String cmd_topic = String(topic_base) + "/" + client_id + "/command";
+    String cmd_topic = String(MQTT_TOPIC_BASE) + "/" + client_id + "/command";
     mqtt.subscribe(cmd_topic.c_str());
     Serial.print("[MQTT] Subscribed: ");
     Serial.println(cmd_topic);

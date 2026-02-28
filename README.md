@@ -17,6 +17,7 @@ Firmware cho hệ thống kiểm soát ra vào và chấm công thông minh sử
 *   **Hệ thống hiển thị:** LCD 16x2 thông báo trạng thái hệ thống, hướng dẫn người dùng.
 *   **Đồng bộ thời gian:** Tự động lấy giờ qua NTP Server.
 *   **Kiến trúc đa nhiệm (Multitasking):** Sử dụng FreeRTOS với cơ chế **Queues** và **Semaphores** để quản lý luồng dữ liệu.
+*   **Tối ưu hóa Codebase:** Toàn bộ thành phần (Network, MQTT, Sensor, Display) được chia module độc lập (Decoupled), giúp giảm tải RAM và dễ dàng nâng cấp/bảo trì.
 
 ## 🛠️ Phần cứng (Hardware)
 
@@ -38,6 +39,18 @@ Cấu hình trong `app_config.h`:
 | **Door Sensor**| GPIO 15 | Input Pull-up (Nối đất khi đóng) |
 | **LCD SDA** | GPIO 21 | Mặc định I2C ESP32 |
 | **LCD SCL** | GPIO 22 | Mặc định I2C ESP32 |
+
+---
+
+## 📂 Cấu trúc Code (Modular Structure)
+
+Dự án được chia module hóa (Modularized) hoàn toàn trong thư mục `lib/` giúp tối ưu RAM và dễ dàng bảo trì:
+* `app_config/`: Chứa các constant, pinout, struct và thông số dùng chung.
+* `door/`: Logic khóa/mở cửa sử dụng máy trạng thái (FSM).
+* `fingerprint/`: Điều khiển cảm biến AS608 và Event Queue.
+* `mqtt/` & `network/`: Tách biệt logic kết nối WiFi và xử lý JSON/MQTT command.
+* `display/`: Module quản lý hàng đợi xuất thông báo ra màn hình LCD không gây nghẽn.
+* `utils/`: Các hàm hỗ trợ như lấy timestamp (NTP/RTC nội).
 
 ---
 
@@ -135,7 +148,7 @@ Topic: `.../status`, `.../fingerprint`, `.../door`
     git clone https://github.com/vmh714/Iot_project_firmware.git
     ```
 2.  **Cấu hình:**
-    *   Mở file `src/app_config.h` (hoặc `include/app_config.h` tùy cấu trúc).
+    *   Mở file cấu hình trung tâm tại `lib/app_config/app_config.h`.
     *   Cập nhật thông tin WiFi:
         ```cpp
         #define WIFI_SSID "Your_WiFi_Name"

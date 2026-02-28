@@ -21,6 +21,10 @@
 // MQTT
 #define MQTT_BROKER "broker.emqx.io"
 #define MQTT_PORT 1883
+#define MQTT_TOPIC_BASE "esp32/vmh-test"
+#define MQTT_USERNAME "emqx-vmh-test"
+#define MQTT_PASSWORD "public"
+
 // SYSTEM
 #define DEVICE_ID "esp32_door_001"
 // FREERTOS
