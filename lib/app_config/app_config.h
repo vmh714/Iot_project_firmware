@@ -20,7 +20,7 @@
 
 // MQTT
 #define MQTT_BROKER "broker.emqx.io"
-#define MQTT_PORT 1883;
+#define MQTT_PORT 1883
 // SYSTEM
 #define DEVICE_ID "esp32_door_001"
 // FREERTOS
@@ -93,6 +93,12 @@ struct LcdEvent_t
     char line1[17]; // Buffer tĩnh 17 ký tự (16 char + null)
     char line2[17];
     uint32_t duration; // Thời gian hiển thị (ms), sau đó tự về IDLE. 0 = vĩnh viễn
+};
+
+struct MqttMsg
+{
+  char topic[50];
+  char payload[150];
 };
 
 #endif

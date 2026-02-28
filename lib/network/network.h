@@ -16,4 +16,8 @@ bool network_init(void);
 bool network_is_connected(void);
 Client *network_get_client(void);
 
+// Thêm hàm lấy địa chỉ IP và dải MAC
+const char* network_get_ip(void);
+const char* network_get_mac(void);
+
 #endif
